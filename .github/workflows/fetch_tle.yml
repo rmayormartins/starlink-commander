@@ -1,5 +1,4 @@
 name: Fetch Starlink TLEs
-
 on:
   schedule:
     - cron: "0 */3 * * *"   # a cada 3 horas
@@ -8,8 +7,10 @@ on:
     paths:
       - ".github/workflows/fetch_tle.yml"
       - "scripts/build_starlink_json.js"
+
 permissions:
   contents: write
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
@@ -22,14 +23,28 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Fetch SpaceX Starlink JSON
+      - name: Fetch Starlink TLEs from CelesTrak
         run: |
           mkdir -p tmp docs/data
-          curl -sS https://api.spacexdata.com/v4/starlink > tmp/starlink_raw.json
+          # -f: falha em erro HTTP (em vez de salvar o corpo de erro)
+          # --retry: CelesTrak ocasionalmente faz rate limit (429)
+          # -A: User-Agent identificavel, exigido por alguns mirrors do CelesTrak
+          curl -fsS --retry 3 --retry-delay 5 \
+            -A "starlink-commander (rmayormartins.github.io)" \
+            "https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle" \
+            -o tmp/starlink.tle
+
+          # Validacao: arquivo nao-vazio e com cara de TLE (linha comecando com "1 ")
+          if [[ ! -s tmp/starlink.tle ]] || ! grep -q "^1 " tmp/starlink.tle; then
+            echo "Resposta invalida do CelesTrak. Primeiros 500 bytes:"
+            head -c 500 tmp/starlink.tle
+            exit 1
+          fi
+
+          echo "TLEs recebidos: $(grep -c '^1 ' tmp/starlink.tle) satelites"
 
       - name: Build starlink_tle.json
-        run: |
-          node scripts/build_starlink_json.js tmp/starlink_raw.json docs/data/starlink_tle.json docs/data/meta.json
+        run: node scripts/build_starlink_json.js tmp/starlink.tle docs/data/starlink_tle.json docs/data/meta.json
 
       - name: Commit & Push
         run: |
@@ -40,5 +55,5 @@ jobs:
             git commit -m "chore(data): update Starlink TLE JSON [skip ci]"
             git push
           else
-            echo "Sem mudanças"
+            echo "Sem mudancas"
           fi
