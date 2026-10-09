@@ -1,7 +1,7 @@
 name: Fetch Starlink TLEs
 on:
   schedule:
-    - cron: "0 */3 * * *"   # a cada 3 horas
+    - cron: "17 */3 * * *"   # a cada 3 horas (minuto 17 para fugir do pico do :00)
   workflow_dispatch:
   push:
     paths:
@@ -11,48 +11,84 @@ on:
 permissions:
   contents: write
 
+# Evita duas execucoes simultaneas (schedule + push) brigando no git push
+concurrency:
+  group: fetch-starlink-tle
+  cancel-in-progress: false
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TLE_URL: "https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle"
+      # So falha o workflow se o ultimo download bom tiver mais que isso
+      MAX_AGE_HOURS: "24"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
+          package-manager-cache: false
 
       - name: Fetch Starlink TLEs from CelesTrak
+        id: fetch
         run: |
           mkdir -p tmp docs/data
-          # -f: falha em erro HTTP (em vez de salvar o corpo de erro)
-          # --retry: CelesTrak ocasionalmente faz rate limit (429)
-          # -A: User-Agent identificavel, exigido por alguns mirrors do CelesTrak
-          curl -fsS --retry 3 --retry-delay 5 \
-            -A "starlink-commander (rmayormartins.github.io)" \
-            "https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle" \
-            -o tmp/starlink.tle
 
-          # Validacao: arquivo nao-vazio e com cara de TLE (linha comecando com "1 ")
-          if [[ ! -s tmp/starlink.tle ]] || ! grep -q "^1 " tmp/starlink.tle; then
-            echo "Resposta invalida do CelesTrak. Primeiros 500 bytes:"
-            head -c 500 tmp/starlink.tle
+          # Politica do CelesTrak (desde mar/2026): 1 download por atualizacao
+          # (a cada 2 h) por IP. Os runners do GitHub compartilham IP, entao um
+          # HTTP 403 "has not updated since your last successful download" pode
+          # ter sido causado por OUTRO repositorio no mesmo runner.
+          # Nao repetir apos 403/404: a resposta nao muda e conta para bloqueio
+          # (curl --retry so repete erros transitorios: 408, 429, 5xx).
+          HTTP_CODE=$(curl -sS --retry 2 --retry-delay 10 --max-time 90 \
+            -A "starlink-commander (rmayormartins.github.io)" \
+            -o tmp/starlink.tle -w "%{http_code}" "$TLE_URL") || true
+          HTTP_CODE=${HTTP_CODE:-000}
+          echo "CelesTrak HTTP $HTTP_CODE"
+
+          if [[ "$HTTP_CODE" == "200" ]] && [[ -s tmp/starlink.tle ]] && grep -q "^1 " tmp/starlink.tle; then
+            echo "TLEs recebidos: $(grep -c '^1 ' tmp/starlink.tle) satelites"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Download falhou: mantem os dados atuais do site
+          echo "updated=false" >> "$GITHUB_OUTPUT"
+          MSG=$(head -c 300 tmp/starlink.tle 2>/dev/null | tr -d '\r' | tr '\n' ' ') || true
+          echo "Resposta do CelesTrak: ${MSG:-<vazia>}"
+
+          AGE_H=$(node -p "Math.floor((Date.now() - Date.parse(require('./docs/data/meta.json').updatedAt)) / 3600000)" 2>/dev/null) || true
+          [[ "$AGE_H" =~ ^[0-9]+$ ]] || AGE_H=9999
+
+          if [[ "$MSG" == *"has not updated"* ]]; then
+            echo "::notice title=CelesTrak sem dados novos::Esta atualizacao ja foi baixada por outro cliente no mesmo IP do runner. Mantendo os dados atuais (${AGE_H} h)."
+          else
+            echo "::warning title=CelesTrak HTTP ${HTTP_CODE}::Download falhou. Mantendo os dados atuais (${AGE_H} h)."
+          fi
+
+          if (( AGE_H >= MAX_AGE_HOURS )); then
+            echo "::error title=Dados desatualizados::Ultimo download com sucesso ha ${AGE_H} h (limite ${MAX_AGE_HOURS} h)."
             exit 1
           fi
 
-          echo "TLEs recebidos: $(grep -c '^1 ' tmp/starlink.tle) satelites"
-
       - name: Build starlink_tle.json
+        if: steps.fetch.outputs.updated == 'true'
         run: node scripts/build_starlink_json.js tmp/starlink.tle docs/data/starlink_tle.json docs/data/meta.json
 
       - name: Commit & Push
+        if: steps.fetch.outputs.updated == 'true'
         run: |
-          if [[ -n "$(git status --porcelain)" ]]; then
+          if [[ -n "$(git status --porcelain docs/data)" ]]; then
             git config user.name "github-actions"
             git config user.email "github-actions@users.noreply.github.com"
             git add docs/data/*.json
             git commit -m "chore(data): update Starlink TLE JSON [skip ci]"
+            git pull --rebase --quiet origin "${GITHUB_REF_NAME}"
             git push
           else
             echo "Sem mudancas"
