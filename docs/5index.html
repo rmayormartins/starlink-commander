@@ -1340,6 +1340,58 @@
       updateStats(0, 0, validCount);
     }
     
+    // --- Basemap escuro ---
+    // Desde ago/2026 a CARTO exige chave (?key=) e, sem ela, desenha
+    // "API key required" em cima dos tiles. A chave e gratuita para uso nao
+    // comercial (ensino, pesquisa): https://carto.com/basemaps/apikey
+    // Cole a chave em CARTO_KEY para voltar ao dark_all da CARTO.
+    // Sem chave: Esri World Dark Gray (nao exige chave). Se o Esri falhar,
+    // cai para OpenStreetMap escurecido por filtro CSS.
+    const CARTO_KEY = "";
+
+    function addDarkBasemap(targetMap, opts) {
+      opts = opts || {};
+      const labels = opts.labels !== false;
+      const zoom = { minZoom: opts.minZoom || 2, maxZoom: opts.maxZoom || 10 };
+      const osmAttr = '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
+      const log = (lvl, msg) => { if (typeof updateTerminalLog === "function") updateTerminalLog(lvl, msg); };
+
+      if (CARTO_KEY) {
+        const style = labels ? "dark_all" : "dark_nolabels";
+        log("MAP", "Basemap: CARTO " + style);
+        return L.tileLayer("https://{s}.basemaps.cartocdn.com/" + style + "/{z}/{x}/{y}{r}.png?key=" + encodeURIComponent(CARTO_KEY), Object.assign({
+          subdomains: "abcd",
+          attribution: osmAttr + ' &copy; <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a>'
+        }, zoom)).addTo(targetMap);
+      }
+
+      const ESRI = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/";
+      const base = L.tileLayer(ESRI + "World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}", Object.assign({
+        attribution: "Tiles &copy; Esri, HERE, Garmin, " + osmAttr
+      }, zoom)).addTo(targetMap);
+      const ref = labels
+        ? L.tileLayer(ESRI + "World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}", Object.assign({}, zoom)).addTo(targetMap)
+        : null;
+      log("MAP", "Basemap: Esri World Dark Gray");
+
+      // Fallback: nenhum tile do Esri carregou -> OpenStreetMap escurecido
+      let loaded = 0, errors = 0, switched = false;
+      base.on("tileload", () => { loaded++; });
+      base.on("tileerror", () => {
+        errors++;
+        if (switched || loaded > 0 || errors < 4) return;
+        switched = true;
+        targetMap.removeLayer(base);
+        if (ref) targetMap.removeLayer(ref);
+        const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", Object.assign({
+          attribution: osmAttr
+        }, zoom)).addTo(targetMap);
+        osm.getContainer().style.filter = "invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.9) saturate(0.35)";
+        log("WARNING", "Esri basemap indisponivel, usando OpenStreetMap");
+      });
+      return base;
+    }
+
     function init2DMap() {
       updateTerminalLog("MAP", "Initializing tactical map system...");
       
@@ -1351,12 +1403,7 @@
       }).setView([obs.lat, obs.lon], 3);
       
       // Dark tactical map
-      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-        attribution: '© TACTICAL MAP',
-        subdomains: 'abcd',
-        maxZoom: 10,
-        minZoom: 2
-      }).addTo(map);
+      addDarkBasemap(map, { labels: true, minZoom: 2, maxZoom: 10 });
       
       // Layer groups
       layerGroup = L.layerGroup().addTo(map);
